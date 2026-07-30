@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Tudovu pipeline-only profile. Publishes a scanned, versioned container image to
+  Amazon ECR. No runtime infrastructure is created — deploy the image wherever you
+  already run workloads.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: app
+    Description: Logical name for the ECR repository.
+  UntaggedImageDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    Description: Days before an untagged image is expired by the lifecycle policy.
+
+Resources:
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+      # Scan every image as it is pushed. This is the registry's own scanner, and it
+      # is separate from the pipeline's Trivy gate — it keeps reporting on images
+      # already published, after the pipeline that built them has finished.
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      # Immutable tags: a tag that can be moved makes "the image we scanned" and "the
+      # image running" different things, which defeats the point of scanning it.
+      ImageTagMutability: IMMUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": ${UntaggedImageDays}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  RepositoryUri:
+    Description: Push and pull images here.
+    Value: !GetAtt AppRepository.RepositoryUri
+  RepositoryArn:
+    Description: For granting pull access to whatever runs the image.
+    Value: !GetAtt AppRepository.Arn
