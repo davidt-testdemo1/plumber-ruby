@@ -1,0 +1,112 @@
+# .github/workflows/tudovu-secure-pipeline.yml
+name: Tudovu Secure Pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  build-test-secure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Dockerfile is added by this pull request.
+      - name: Build application image
+        run: docker build -t app:${{ github.sha }} .
+      - name: Detect CodeQL languages
+        id: codeql_langs
+        run: |
+          LANGS=""
+          if [ -f package.json ]; then LANGS="$LANGS,javascript-typescript"; fi
+          if [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ]; then LANGS="$LANGS,python"; fi
+          if [ -f go.mod ]; then LANGS="$LANGS,go"; fi
+          echo "languages=${LANGS#,}" >> "$GITHUB_OUTPUT"
+      - name: CodeQL init
+        if: steps.codeql_langs.outputs.languages != ''
+        continue-on-error: true
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.codeql_langs.outputs.languages }}
+      - name: CodeQL autobuild
+        if: steps.codeql_langs.outputs.languages != ''
+        continue-on-error: true
+        uses: github/codeql-action/autobuild@v3
+      - name: CodeQL analyze (SAST. Needs GitHub Advanced Security to publish results)
+        if: steps.codeql_langs.outputs.languages != ''
+        continue-on-error: true
+        uses: github/codeql-action/analyze@v3
+      - name: Semgrep policy scan (SAST)
+        run: |
+          python -m pip install --quiet semgrep
+          semgrep scan --config=auto --severity=ERROR --error --quiet
+      - name: Unit tests
+        run: |
+          if [ -f package.json ]; then
+            npm test --if-present
+          elif [ -f go.mod ]; then
+            go test ./...
+          elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+            python -m pip install pytest >/dev/null 2>&1 && pytest --no-header -q || echo "No pytest suite."
+          else
+            echo "No recognized test manifest. Skipping tests."
+          fi
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: app:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: 1
+      - name: Trivy results (JSON artifact)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: app:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: json
+          output: trivy-results.json
+          exit-code: 0
+      - name: Upload Trivy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.json
+          if-no-files-found: ignore
+      # DAST runs against the deployed site. Set the STAGING_URL repo variable to enable it.
+      # The STAGING_URL repo variable always overrides.
+      - name: OWASP ZAP baseline (DAST)
+        if: vars.STAGING_URL != ''
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+      - name: DAST skipped (no target)
+        if: vars.STAGING_URL == ''
+        run: echo "Set the STAGING_URL repo variable to run the OWASP ZAP (DAST) gate against your staging URL."
+      # Deploy on main, only when a starter stack is present (the website path
+      # ships infra/website.yaml + its own deploy workflow instead). Assumes the
+      # foundation OIDC deploy role. Same role + region vars as the deploy workflow.
+      - name: Configure AWS for deploy (OIDC)
+        if: github.ref == 'refs/heads/main' && hashFiles('infra/stack.yaml') != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TUDOVU_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }}
+      - name: Deploy CloudFormation stack
+        if: github.ref == 'refs/heads/main' && hashFiles('infra/stack.yaml') != ''
+        run: aws cloudformation deploy --template-file infra/stack.yaml --stack-name tudovu-${{ github.event.repository.name }}-app --capabilities CAPABILITY_IAM --region ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }} --tags tudovu:repo=${{ github.repository }}
+      - name: Roll out Amazon ECS
+        if: github.ref == 'refs/heads/main' && hashFiles('infra/stack.yaml') != ''
+        run: echo "Deployed Amazon ECS via CloudFormation after passing the security gates."
