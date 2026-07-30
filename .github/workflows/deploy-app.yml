@@ -1,0 +1,58 @@
+# .github/workflows/deploy-app.yml — container service deploy (gated on the secure pipeline)
+name: Deploy App
+on:
+  workflow_run:
+    workflows: ["Tudovu Secure Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Redeploy as a separate SDLC phase (dev/test/prod) in its own stack. Leave blank for the primary stack."
+        required: false
+        type: string
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    # Auto: only after the secure pipeline passes. Manual: always (workflow_dispatch).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TUDOVU_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push image
+        run: |
+          # Per-app ECR repo named after the repository (lowercased for ECR).
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          aws ecr describe-repositories --repository-names "$REPO" --region us-east-1 >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPO" --region us-east-1 --tags Key=tudovu:repo,Value=${{ github.repository }} >/dev/null
+          IMAGE=${{ steps.ecr.outputs.registry }}/$REPO:${{ github.sha }}
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Resolve VPC + deploy
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text --region us-east-1)
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then echo "No default VPC in us-east-1 — create one, or set VpcId/PublicSubnetIds."; exit 1; fi
+          SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ',')
+          if [ -z "$SUBNET_IDS" ]; then SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ','); fi
+          # ECS needs its service-linked role; create it if the account doesn't have one yet (idempotent).
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com >/dev/null 2>&1 || true
+          # Phase-scoped stack: a dispatched stage deploys an isolated <repo>-<stage>-app
+          # stack (Save Game); the auto path leaves the primary <repo>-app stack untouched.
+          STAGE="${{ github.event.inputs.stage }}"
+          SUFFIX=""
+          [ -n "$STAGE" ] && SUFFIX="-$STAGE"
+          APP_STACK="tudovu-${{ github.event.repository.name }}${SUFFIX}-app"
+          EFFECTIVE_STAGE="${STAGE:-dev}"
+          STAGE_TAG=""
+          [ -n "$EFFECTIVE_STAGE" ] && STAGE_TAG="tudovu:stage=$EFFECTIVE_STAGE"
+          aws cloudformation deploy --template-file infra/app.yaml --stack-name "$APP_STACK" --capabilities CAPABILITY_IAM --region us-east-1 --tags tudovu:repo=${{ github.repository }} tudovu:customer=plumber-exam $STAGE_TAG --parameter-overrides ImageUri="$IMAGE" VpcId="$VPC_ID" PublicSubnetIds="$SUBNET_IDS"
