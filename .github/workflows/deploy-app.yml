@@ -1,0 +1,70 @@
+# .github/workflows/deploy-app.yml
+name: Publish image to ECR
+
+on:
+  workflow_run:
+    workflows: ["Tudovu Secure Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Optional stage tag (dev, test, prod)
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    # Auto: only after the secure pipeline passes. Manual: always (workflow_dispatch).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TUDOVU_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }}
+      - name: Create or update the ECR repository
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          REPO=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          aws cloudformation deploy --template-file infra/app.yaml --stack-name "tudovu-$REPO-ecr" --region us-east-1 --tags "tudovu:repo=$REPO_FULL" --parameter-overrides AppName="$REPO"
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          REPO=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          STAGE=$(printf '%s' "${STAGE_INPUT:-}" | tr -cd 'a-z0-9._-' | cut -c1-32)
+          IMAGE="$ECR_REGISTRY/$REPO:$GIT_SHA"
+          docker build -t "$IMAGE" .
+          # A second, stage-named tag when one was dispatched, so "what is in test" is
+          # answerable without cross-referencing commit SHAs. The SHA tag is the
+          # immutable one; this is a convenience alias pushed alongside it.
+          if [ -n "$STAGE" ]; then docker tag "$IMAGE" "$ECR_REGISTRY/$REPO:$STAGE-$GIT_SHA"; fi
+          docker push --all-tags "$ECR_REGISTRY/$REPO"
+          echo "Published $IMAGE" >> "$GITHUB_STEP_SUMMARY"
+      - name: Where to find it
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          REPO=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          aws cloudformation describe-stacks --stack-name "tudovu-$REPO-ecr" --region us-east-1 --query "Stacks[0].Outputs" --output table
