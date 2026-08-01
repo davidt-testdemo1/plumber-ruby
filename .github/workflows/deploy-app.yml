@@ -1,0 +1,100 @@
+# .github/workflows/deploy-app.yml — container service deploy (gated on the secure pipeline)
+name: Deploy App
+on:
+  workflow_run:
+    workflows: ["Tudovu Secure Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Redeploy as a separate SDLC phase (dev/test/prod) in its own stack. Leave blank for the primary stack."
+        required: false
+        type: string
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    # Auto: only after the secure pipeline passes. Manual: always (workflow_dispatch).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TUDOVU_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push image
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Per-app ECR repo named after the repository (lowercased for ECR).
+          REPO=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          aws ecr describe-repositories --repository-names "$REPO" --region us-east-1 >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPO" --region us-east-1 --tags "Key=tudovu:repo,Value=$REPO_FULL" >/dev/null
+          IMAGE="$ECR_REGISTRY/$REPO:$GIT_SHA"
+          docker build --label "org.opencontainers.image.source=https://github.com/$REPO_FULL" -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Resolve VPC + deploy
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text --region us-east-1)
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then echo "No default VPC in us-east-1 — create one, or set VpcId/PublicSubnetIds."; exit 1; fi
+          SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ',')
+          if [ -z "$SUBNET_IDS" ]; then SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ','); fi
+          # ECS needs its service-linked role; create it if the account doesn't have one yet (idempotent).
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com >/dev/null 2>&1 || true
+          # Phase-scoped stack: a dispatched stage deploys an isolated <repo>-<stage>-app
+          # stack (Save Game); the auto path leaves the primary <repo>-app stack untouched.
+          # $STAGE_INPUT / $REPO_NAME come from the step's env: block, never from a
+          # GitHub Actions expression — see DEPLOY_STEP_ENV_YAML.
+          STAGE=$(printf '%s' "${STAGE_INPUT:-}" | tr -cd 'a-z0-9._-' | cut -c1-32)
+          SUFFIX=""
+          [ -n "$STAGE" ] && SUFFIX="-$STAGE"
+          APP_STACK="tudovu-${REPO_NAME}${SUFFIX}-app"
+          EFFECTIVE_STAGE="${STAGE:-dev}"
+          STAGE_TAG=""
+          [ -n "$EFFECTIVE_STAGE" ] && STAGE_TAG="tudovu:stage=$EFFECTIVE_STAGE"
+          echo "APP_STACK=$APP_STACK" >> "$GITHUB_ENV"
+          aws cloudformation deploy --template-file infra/app.yaml --stack-name "$APP_STACK" --capabilities CAPABILITY_IAM --region us-east-1 --tags "tudovu:repo=$REPO_FULL" $STAGE_TAG --parameter-overrides ImageUri="$IMAGE" VpcId="$VPC_ID" PublicSubnetIds="$SUBNET_IDS"
+      - name: Why the deploy failed
+        if: failure()
+        run: |
+          echo "The stack did not deploy. CloudFormation's own reasons follow."
+          aws cloudformation describe-stack-events --stack-name "$APP_STACK" --region us-east-1 \
+            --query "reverse(StackEvents[?ResourceStatusReason!=null && ends_with(ResourceStatus, 'FAILED')].[ResourceStatus,LogicalResourceId,ResourceStatusReason])" \
+            --output text 2>/dev/null | head -25 || true
+          echo "--- current stack status ---"
+          aws cloudformation describe-stacks --stack-name "$APP_STACK" --region us-east-1 \
+            --query "Stacks[0].[StackStatus,StackStatusReason]" --output text 2>/dev/null || true
+          # The single most important failure class produces NO failed stack events at all: a
+          # service that cannot place a task leaves CloudFormation sitting in CREATE_IN_PROGRESS
+          # while ECS retries, for up to three hours. Everything above prints nothing in that
+          # case. The reason is in the ECS service's own event stream and in the stopped tasks —
+          # measured live: a task that could not pull its image sat for 20 minutes with the
+          # stack "in progress" and no signal anywhere else.
+          echo "--- ECS service events (why tasks are not running) ---"
+          CLUSTER=$(aws ecs list-clusters --region us-east-1 --query "clusterArns[?contains(@, '$APP_STACK')]|[0]" --output text 2>/dev/null)
+          if [ -n "$CLUSTER" ] && [ "$CLUSTER" != "None" ]; then
+            SVC=$(aws ecs list-services --cluster "$CLUSTER" --region us-east-1 --query "serviceArns[0]" --output text 2>/dev/null)
+            aws ecs describe-services --cluster "$CLUSTER" --services "$SVC" --region us-east-1 \
+              --query "services[0].events[:8].message" --output text 2>/dev/null || true
+            echo "--- why the last tasks stopped ---"
+            for t in $(aws ecs list-tasks --cluster "$CLUSTER" --desired-status STOPPED --region us-east-1 --query "taskArns[:3]" --output text 2>/dev/null); do
+              aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$t" --region us-east-1 \
+                --query "tasks[0].[stoppedReason,containers[0].reason]" --output text 2>/dev/null || true
+            done
+          fi
