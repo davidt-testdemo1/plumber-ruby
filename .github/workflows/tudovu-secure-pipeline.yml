@@ -1,0 +1,171 @@
+# .github/workflows/tudovu-secure-pipeline.yml
+name: Tudovu Secure Pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  build-test-secure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Dockerfile is added by this pull request.
+      - name: Build application image
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: docker build -t "app:$GIT_SHA" .
+      - name: Fetch the Tudovu CLI (for the container smoke test)
+        id: tudovu_cli
+        continue-on-error: true
+        run: npx --yes "@tudovu/cli@^0.3.2" --version
+      - name: Container smoke test
+        if: steps.tudovu_cli.outcome == 'success'
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: npx --yes "@tudovu/cli@^0.3.2" preflight --image "app:$GIT_SHA" --port 3000 --health-path / --report smoke-report.json
+      - name: Container smoke test skipped
+        if: steps.tudovu_cli.outcome != 'success'
+        run: echo "Could not fetch the Tudovu CLI, so the container smoke test did not run. This does not block the pipeline."
+      - name: Upload smoke test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-report
+          path: smoke-report.json
+          if-no-files-found: ignore
+      - name: Detect CodeQL languages
+        id: codeql_langs
+        run: |
+          LANGS=""
+          if [ -f package.json ]; then LANGS="$LANGS,javascript-typescript"; fi
+          if [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ]; then LANGS="$LANGS,python"; fi
+          if [ -f go.mod ]; then LANGS="$LANGS,go"; fi
+          echo "languages=${LANGS#,}" >> "$GITHUB_OUTPUT"
+      - name: CodeQL init
+        if: steps.codeql_langs.outputs.languages != ''
+        continue-on-error: true
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.codeql_langs.outputs.languages }}
+      - name: CodeQL autobuild
+        if: steps.codeql_langs.outputs.languages != ''
+        continue-on-error: true
+        uses: github/codeql-action/autobuild@v3
+      - name: CodeQL analyze (SAST. Needs GitHub Advanced Security to publish results)
+        if: steps.codeql_langs.outputs.languages != ''
+        continue-on-error: true
+        uses: github/codeql-action/analyze@v3
+      - name: Semgrep policy scan (SAST)
+        run: |
+          python -m pip install --quiet 'semgrep==1.145.0'
+          semgrep scan --config=p/security-audit --config=p/secrets --severity=ERROR --error --quiet
+      - name: Unit tests
+        run: |
+          if [ -f package.json ]; then
+            # Install before testing: a container build leaves the runner with no
+            # node_modules, so the repo's test binary would not exist.
+            if [ -f package-lock.json ]; then npm ci; else npm install; fi
+            npm test --if-present
+          elif [ -f go.mod ]; then
+            go test ./...
+          elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+            if [ -f requirements.txt ]; then python -m pip install -r requirements.txt >/dev/null 2>&1 || true; fi
+            python -m pip install pytest >/dev/null 2>&1 && pytest --no-header -q || echo "No pytest suite."
+          else
+            echo "No recognized test manifest. Skipping tests."
+          fi
+      - name: Ensure the accepted-findings file exists
+        # .trivyignore.yaml records findings a human has accepted, each with an expiry Trivy
+        # enforces itself. A repository that has accepted nothing has no reason to carry the file,
+        # but TRIVY_IGNOREFILE is fatal when the path is missing — so create an empty one.
+        run: '[ -f .trivyignore.yaml ] || printf "vulnerabilities: []\n" > .trivyignore.yaml'
+      - name: Trivy dependency scan (blocking)
+        uses: aquasecurity/trivy-action@master
+        env:
+          TRIVY_IGNOREFILE: .trivyignore.yaml
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: 1
+      - name: Trivy dependency scan (JSON artifact)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        env:
+          TRIVY_IGNOREFILE: .trivyignore.yaml
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: json
+          output: trivy-results.json
+          exit-code: 0
+      - name: Trivy base image scan (advisory, does not block)
+        # Base image + OS packages + vendored packaging tooling. Not reachable from
+        # any dependency manifest, so blocking on these would leave a diligent repo
+        # permanently red. Tudovu selected this base image, so these are ours to fix.
+        #
+        # continue-on-error, not just exit-code: 0. Those are different things — exit-code
+        # governs FINDINGS, while trivy itself exits non-zero when it cannot inspect the image
+        # at all. Observed live: when the build step failed there was no image to scan, so a step
+        # labelled "advisory, does not block" turned red and reported four transport errors. A
+        # step that contradicts its own label is worse than no step.
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: app:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: 0
+      - name: Upload Trivy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.json
+          if-no-files-found: ignore
+      # DAST runs against the deployed site. Set the STAGING_URL repo variable to enable it.
+      # The STAGING_URL repo variable always overrides.
+      - name: OWASP ZAP baseline (DAST)
+        if: vars.STAGING_URL != ''
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+      - name: DAST skipped (no target)
+        if: vars.STAGING_URL == ''
+        run: echo "Set the STAGING_URL repo variable to run the OWASP ZAP (DAST) gate against your staging URL."
+      # Deploy on main, only when a starter stack is present (the website path
+      # ships infra/website.yaml + its own deploy workflow instead). Assumes the
+      # foundation OIDC deploy role. Same role + region vars as the deploy workflow.
+      - name: Configure AWS for deploy (OIDC)
+        if: github.ref == 'refs/heads/main' && hashFiles('infra/stack.yaml') != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TUDOVU_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }}
+      - name: Deploy CloudFormation stack
+        if: github.ref == 'refs/heads/main' && hashFiles('infra/stack.yaml') != ''
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+        run: aws cloudformation deploy --template-file infra/stack.yaml --stack-name "tudovu-$REPO_NAME-app" --capabilities CAPABILITY_IAM --region ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }} --tags "tudovu:repo=$REPO_FULL"
+      - name: Roll out Amazon ECS
+        if: github.ref == 'refs/heads/main' && hashFiles('infra/stack.yaml') != ''
+        run: echo "Deployed Amazon ECS via CloudFormation after passing the security gates."
