@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Container service (Tudovu). ECS Fargate behind an internet-facing
+  Application Load Balancer (HTTP). Image from ECR. No custom domain — served on
+  the ALB DNS name. Add a domain via the Website path for HTTPS + Route53.
+
+# ── Variables your app reads that Tudovu could not supply ──────────────────────
+# RAILS_MAX_THREADS, WEB_CONCURRENCY, RAILS_ENV, SOLID_QUEUE_IN_PUMA, PIDFILE, DATABASE_URL, SECRET_KEY_BASE
+#
+# These are intentionally NOT set on the container. Setting them to an empty string
+# would be worse than leaving them alone: code like os.environ.setdefault(...) or
+# process.env.X ?? default treats an empty value as "already configured" and skips
+# its own default.
+#
+# Plain values: set the matching Env* parameter below.
+# Credentials and connection strings: create a Secrets Manager secret and add it to
+# the task definition's Secrets list — Tudovu will not invent a value, because a
+# random string cannot authenticate to a third party or parse as a connection URL.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to run the service + load balancer in.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more public subnets for the ALB and Fargate tasks.
+  ImageUri:
+    Type: String
+    Description: ECR image URI the CI/CD workflow pushes.
+  DesiredCount:
+    Type: Number
+    Default: 2
+  EnvRailsMaxThreads:
+    Type: String
+    Default: ""
+    Description: Optional RAILS_MAX_THREADS for the app container. Injected only when non-empty.
+  EnvWebConcurrency:
+    Type: String
+    Default: ""
+    Description: Optional WEB_CONCURRENCY for the app container. Injected only when non-empty.
+  EnvRailsEnv:
+    Type: String
+    Default: ""
+    Description: Optional RAILS_ENV for the app container. Injected only when non-empty.
+  EnvSolidQueueInPuma:
+    Type: String
+    Default: ""
+    Description: Optional SOLID_QUEUE_IN_PUMA for the app container. Injected only when non-empty.
+  EnvPidfile:
+    Type: String
+    Default: ""
+    Description: Optional PIDFILE for the app container. Injected only when non-empty.
+
+Conditions:
+  HasEnvRailsMaxThreads: !Not [!Equals [!Ref EnvRailsMaxThreads, ""]]
+  HasEnvWebConcurrency: !Not [!Equals [!Ref EnvWebConcurrency, ""]]
+  HasEnvRailsEnv: !Not [!Equals [!Ref EnvRailsEnv, ""]]
+  HasEnvSolidQueueInPuma: !Not [!Equals [!Ref EnvSolidQueueInPuma, ""]]
+  HasEnvPidfile: !Not [!Equals [!Ref EnvPidfile, ""]]
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress (HTTP 80) from the internet.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tasks accept traffic only from the ALB.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-399
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/tudovu/${AWS::StackName}"
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/TudovuArchitectBoundary'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !Ref TaskExecutionRole
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          PortMappings:
+            - ContainerPort: 3000
+          Essential: true
+          Environment:
+            - !If
+              - HasEnvRailsMaxThreads
+              - Name: RAILS_MAX_THREADS
+                Value: !Ref EnvRailsMaxThreads
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvWebConcurrency
+              - Name: WEB_CONCURRENCY
+                Value: !Ref EnvWebConcurrency
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvRailsEnv
+              - Name: RAILS_ENV
+                Value: !Ref EnvRailsEnv
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvSolidQueueInPuma
+              - Name: SOLID_QUEUE_IN_PUMA
+                Value: !Ref EnvSolidQueueInPuma
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvPidfile
+              - Name: PIDFILE
+                Value: !Ref EnvPidfile
+              - !Ref "AWS::NoValue"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AppUrl:
+    Description: App URL (ALB DNS). Add a custom domain via the Website path for HTTPS.
+    Value: !Sub "http://${LoadBalancer.DNSName}"
